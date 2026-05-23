@@ -36,34 +36,69 @@ local Camera      = workspace.CurrentCamera
 -- We then pass a wrapped loadstring of that URL to whichever
 -- queue_on_teleport function the executor exposes.
 ------------------------------------------------------------------
-do
-    -- Default URL — the user's hosted script location. Overridable
-    -- by setting _G.LT2_SCRIPT_URL before running. Auto-detected
-    -- so Potassium users don't have to do anything extra.
-    if not _G.LT2_SCRIPT_URL then
-        _G.LT2_SCRIPT_URL = "https://raw.githubusercontent.com/multigrambar/zpanel/refs/heads/main/myscript.txt"
-    end
+-- Default URL — overridable via _G.LT2_SCRIPT_URL before running
+if not _G.LT2_SCRIPT_URL then
+    _G.LT2_SCRIPT_URL = "https://raw.githubusercontent.com/multigrambar/zpanel/refs/heads/main/myscript.txt"
+end
 
-    local qot = queue_on_teleport                            -- Potassium, KRNL, Fluxus, most
-              or (syn and syn.queue_on_teleport)              -- Synapse X
-              or (fluxus and fluxus.queue_on_teleport)        -- Fluxus (also exports global)
-              or (getgenv and getgenv().queue_on_teleport)
-    if qot and _G.LT2_SCRIPT_URL then
-        local ok, err = pcall(function()
-            qot(([[loadstring(game:HttpGet("%s"))()]]):format(_G.LT2_SCRIPT_URL))
+-- queue_on_teleport detector — Potassium uses the bare global per
+-- their docs; Synapse/Fluxus use namespaced ones as backup paths
+local function getQOT()
+    return queue_on_teleport
+        or (syn and syn.queue_on_teleport)
+        or (fluxus and fluxus.queue_on_teleport)
+        or (getgenv and getgenv().queue_on_teleport)
+end
+
+-- Build the payload — includes any pending-find state so a chain of
+-- hops keeps the find alive. extraCode is prepended raw, before the
+-- loadstring, so things like `_G.LT2_PendingFind = "LoneCave"` happen
+-- BEFORE the script reloads.
+local function buildPayload(extraCode)
+    return (extraCode or "")
+        .. ([[loadstring(game:HttpGet("%s"))()]]):format(_G.LT2_SCRIPT_URL)
+end
+
+local function fireQueue(extraCode, reason)
+    local qot = getQOT()
+    if not qot then
+        warn("[ZPanel] No queue_on_teleport available — script won't reload")
+        return false
+    end
+    local payload = buildPayload(extraCode)
+    local ok, err = pcall(function() qot(payload) end)
+    if ok then
+        warn("[ZPanel] Queued re-inject (" .. (reason or "manual") .. ")")
+    else
+        warn("[ZPanel] queue_on_teleport failed: " .. tostring(err))
+    end
+    return ok
+end
+
+-- IMMEDIATE queue at startup (covers manual Roblox menu teleports)
+fireQueue(nil, "startup")
+
+-- Hook OnTeleport — the canonical pattern from executor docs. Fires
+-- the moment the player initiates ANY teleport, so we re-queue even
+-- if our startup call got consumed by an earlier teleport.
+do
+    local ok = pcall(function()
+        LocalPlayer.OnTeleport:Connect(function(state)
+            if state == Enum.TeleportState.Started
+            or state == Enum.TeleportState.InProgress
+            or state == Enum.TeleportState.WaitingForServer then
+                -- Preserve any pending state for the next server
+                local extra = ""
+                if _G.LT2_PendingFind then
+                    extra = string.format("_G.LT2_PendingFind = %q\n",
+                        _G.LT2_PendingFind)
+                end
+                fireQueue(extra, "OnTeleport." .. tostring(state))
+            end
         end)
-        if ok then
-            warn("[ZPanel] Queued for re-inject on next teleport (URL: "
-                .. _G.LT2_SCRIPT_URL .. ")")
-        else
-            warn("[ZPanel] queue_on_teleport failed: " .. tostring(err))
-        end
-    elseif not qot then
-        warn("[ZPanel] No queue_on_teleport in this executor — script "
-            .. "won't auto-rerun on teleport. (Potassium normally exposes it.)")
-    elseif not _G.LT2_SCRIPT_URL then
-        warn("[ZPanel] Set _G.LT2_SCRIPT_URL before running to enable "
-            .. "auto-rerun on teleport.")
+    end)
+    if not ok then
+        warn("[ZPanel] OnTeleport hook failed — manual teleports may not reload")
     end
 end
 
@@ -109,26 +144,25 @@ local function getOtherServers()
     return list
 end
 
--- Hop to a random other LT2 server. Optionally include extra Lua
--- code in the queue_on_teleport payload (e.g. set a pending-find).
+-- Hop to a random other LT2 server. Pre-queues the script with
+-- extraQueueCode prepended so state (like pending-find) survives.
+-- Tries up to 5 different jobIds in case one rejects.
 local function serverHop(extraQueueCode)
     local servers = getOtherServers()
-    if #servers == 0 then return false, "No servers available" end
-    -- Re-queue the script with any extra code prepended
-    local qot = queue_on_teleport
-              or (syn and syn.queue_on_teleport)
-              or (fluxus and fluxus.queue_on_teleport)
-              or (getgenv and getgenv().queue_on_teleport)
-    if qot and _G.LT2_SCRIPT_URL then
-        local payload = (extraQueueCode or "") ..
-            ([[loadstring(game:HttpGet("%s"))()]]):format(_G.LT2_SCRIPT_URL)
-        pcall(function() qot(payload) end)
+    if #servers == 0 then return false, "API returned no servers" end
+    -- Pre-fire the queue NOW (before teleport starts) so it's set
+    -- regardless of whether OnTeleport fires fast enough
+    fireQueue(extraQueueCode, "pre-hop")
+    -- Try a few servers in case one is full / private / rejected
+    for i = 1, math.min(5, #servers) do
+        local ok, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(LT2_PLACE_ID, servers[i], LocalPlayer)
+        end)
+        if ok then return true end
+        warn("[ZPanel] Hop attempt " .. i .. " failed: " .. tostring(err))
+        task.wait(0.3)
     end
-    local ok, err = pcall(function()
-        TeleportService:TeleportToPlaceInstance(LT2_PLACE_ID, servers[1], LocalPlayer)
-    end)
-    if not ok then return false, tostring(err) end
-    return true
+    return false, "All hop attempts rejected"
 end
 
 -- Pending-find handler: runs after the panel boots if a previous
@@ -1989,22 +2023,29 @@ do
     local previewActive = false
     local previewItem   = nil
     local previewGhost  = nil
-    local previewConn1, previewConn2
+    local previewConn1, previewConn2, previewConn3, previewConn4
+    -- Rotation state: yaw on Y (Q/P), pitch on X (T). Accumulates while
+    -- keys are held and gets re-applied every RenderStepped frame.
+    local rotYaw, rotPitch = 0, 0
+    local holdQ, holdP, holdT = false, false, false
 
     local function endPreview()
         previewActive = false
         previewItem   = nil
+        holdQ, holdP, holdT = false, false, false
+        rotYaw, rotPitch = 0, 0
         if previewGhost then
             pcall(function() previewGhost:Destroy() end)
             previewGhost = nil
         end
         if previewConn1 then previewConn1:Disconnect(); previewConn1 = nil end
         if previewConn2 then previewConn2:Disconnect(); previewConn2 = nil end
+        if previewConn3 then previewConn3:Disconnect(); previewConn3 = nil end
+        if previewConn4 then previewConn4:Disconnect(); previewConn4 = nil end
     end
 
     makeButtonRow(selCard, "Place picked item at mouse (preview)", "TP Preview", function()
-        endPreview()  -- reset any leftover state
-        -- Need exactly 1 item selected
+        endPreview()
         local picks = {}
         for it in pairs(selected) do
             if it and it.Parent then table.insert(picks, it) end
@@ -2013,10 +2054,8 @@ do
         if #picks > 1 then log("✗ TP Preview only works with 1 item (have " .. #picks .. ")"); return end
         previewItem = picks[1]
         previewActive = true
+        rotYaw, rotPitch = 0, 0
 
-        -- Build the ghost: a Highlight + a green BoxHandleAdornment
-        -- that follows the mouse target position. Visual-only — no
-        -- physics, no server-side replication.
         local mp = previewItem:IsA("BasePart") and previewItem
                 or (previewItem.PrimaryPart
                     or previewItem:FindFirstChildWhichIsA("BasePart", true))
@@ -2039,16 +2078,28 @@ do
         outline.Color3 = Color3.fromRGB(70, 200, 130)
         outline.Parent = previewGhost
 
-        log("→ TP Preview: move mouse, LEFT-click to commit, RIGHT-click to cancel")
+        log("→ TP Preview: LEFT-click to commit, RIGHT-click cancel | "
+            .. "Q/P = yaw, T = pitch (hold)")
 
         local mouse = LocalPlayer:GetMouse()
-        previewConn1 = RunService.RenderStepped:Connect(function()
+        local ROT_SPEED = math.rad(120)  -- 120°/sec while held
+
+        previewConn1 = RunService.RenderStepped:Connect(function(dt)
             if not previewActive or not previewGhost then return end
+            -- Apply rotation deltas first
+            if holdQ then rotYaw   = rotYaw   - ROT_SPEED * dt end
+            if holdP then rotYaw   = rotYaw   + ROT_SPEED * dt end
+            if holdT then rotPitch = rotPitch + ROT_SPEED * dt end
+            -- Compose position (mouse hit + half-height) + rotation
+            local pos
             if mouse.Target then
-                previewGhost.CFrame = CFrame.new(mouse.Hit.p + Vector3.new(0, mp.Size.Y * 0.5, 0))
+                pos = mouse.Hit.p + Vector3.new(0, mp.Size.Y * 0.5, 0)
             else
-                previewGhost.CFrame = CFrame.new(mouse.Hit.p)
+                pos = mouse.Hit.p
             end
+            previewGhost.CFrame = CFrame.new(pos)
+                * CFrame.Angles(0, rotYaw, 0)
+                * CFrame.Angles(rotPitch, 0, 0)
         end)
 
         previewConn2 = UserInputService.InputBegan:Connect(function(input, processed)
@@ -2064,6 +2115,21 @@ do
             elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
                 log("TP Preview cancelled")
                 endPreview()
+            elseif input.UserInputType == Enum.UserInputType.Keyboard then
+                local kc = input.KeyCode
+                if kc == Enum.KeyCode.Q then holdQ = true
+                elseif kc == Enum.KeyCode.P then holdP = true
+                elseif kc == Enum.KeyCode.T then holdT = true
+                end
+            end
+        end)
+
+        previewConn3 = UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+            local kc = input.KeyCode
+            if kc == Enum.KeyCode.Q then holdQ = false
+            elseif kc == Enum.KeyCode.P then holdP = false
+            elseif kc == Enum.KeyCode.T then holdT = false
             end
         end)
     end, 9)
@@ -2537,30 +2603,127 @@ do
     themeify(batchLabel, "TextColor3", "Text")
     makeSliderRow(treeCard, 1, 1, 20, function(v) batchCount = v end, 4)
 
-    -- Wrap cutAndBringTree to loop N times in series.
-    -- Auto-recovery for trees that kill the player (LoneCave especially).
-    -- When you Die during a batch, watch for the dropped EndTimesAxe
-    -- in workspace + fire ClientInteracted("Pick up tool") to recover
-    -- it, then continue the batch.
-    local function recoverAxesAfterDeath()
-        local char = LocalPlayer.CharacterAdded:Wait()
-        local newHrp = char:WaitForChild("HumanoidRootPart", 10)
-        if not newHrp then return end
-        task.wait(1.5)  -- let respawn settle
+    -- LoneCave auto-pickup — faithful port of script4's pattern
+    -- (script4 lines 1934-1962, three connections per cut):
+    --
+    --   1) Humanoid.Died → fire ClientInteracted("Drop tool") on every
+    --      Backpack tool so they spawn as MODELS in workspace.PlayerModels.
+    --      (Server normally does this on death, but firing manually
+    --      guarantees it + lets us track exactly which Models are ours.)
+    --
+    --   2) workspace.PlayerModels.ChildAdded → watch for owned axe
+    --      Models as they spawn. Filter: Owner.Value == LocalPlayer AND
+    --      ToolName.Value matches an axe (most are named *Axe*, plus
+    --      the BasicHatchet / Rukiryaxe specials).
+    --
+    --   3) CharacterAdded → wait for respawn, TP back to tree position,
+    --      then fire ClientInteracted("Pick up tool") on each tracked
+    --      axe Model.
+    --
+    -- Why a Model and not a Tool: when LT2 drops an axe on death,
+    -- the server creates a Model in workspace.PlayerModels containing
+    -- a Handle + Owner + ToolName + the visual mesh. We pass THAT
+    -- model to ClientInteracted as the target.
+    local function setupLoneCaveAutoPickup(treePos)
         local interact = game:GetService("ReplicatedStorage"):FindFirstChild("Interaction")
         local ci = interact and interact:FindFirstChild("ClientInteracted")
-        if not ci then return end
-        local picked = 0
-        for _, obj in ipairs(workspace:GetChildren()) do
-            if obj:IsA("Tool") and obj:FindFirstChild("ToolName")
-            and obj:FindFirstChild("Handle") then
-                if (obj.Handle.Position - newHrp.Position).Magnitude < 80 then
-                    pcall(function() ci:FireServer(obj, "Pick up tool") end)
+        if not ci then return function() end end
+
+        local trackedAxes = {}      -- list of axe Models to pick up
+        local diedConn, addConn, charConn
+
+        local function disconnectAll()
+            if diedConn then diedConn:Disconnect(); diedConn = nil end
+            if addConn  then addConn:Disconnect();  addConn  = nil end
+            if charConn then charConn:Disconnect(); charConn = nil end
+        end
+
+        -- 1) Pre-arm Died handler: drop all tools so they spawn as Models
+        local char = LocalPlayer.Character
+        local hum  = char and char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            diedConn = hum.Died:Connect(function()
+                log("  ⚠ Player died — dropping tools for re-pickup")
+                local bp = LocalPlayer:FindFirstChild("Backpack")
+                if bp then
+                    for _, tool in ipairs(bp:GetChildren()) do
+                        if tool:IsA("Tool") and tool.Name ~= "BlueprintTool" then
+                            pcall(function()
+                                ci:FireServer(tool, "Drop tool")
+                            end)
+                        end
+                    end
+                end
+            end)
+        end
+
+        -- 2) Pre-arm PlayerModels.ChildAdded to track our dropped axes
+        local pm = workspace:FindFirstChild("PlayerModels")
+        if pm then
+            addConn = pm.ChildAdded:Connect(function(b)
+                local owner = b:WaitForChild("Owner", 5)
+                local toolName = b:WaitForChild("ToolName", 5)
+                if owner and owner.Value == LocalPlayer
+                and toolName and toolName.Value
+                and (toolName.Value:lower():find("axe")
+                     or toolName.Value == "BasicHatchet"
+                     or toolName.Value == "Rukiryaxe") then
+                    table.insert(trackedAxes, b)
+                    log("  · Tracking dropped axe: " .. toolName.Value)
+                end
+            end)
+        end
+
+        -- 3) CharacterAdded → TP back + re-pickup tracked axes
+        charConn = LocalPlayer.CharacterAdded:Connect(function(newChar)
+            local newHrp = newChar:WaitForChild("HumanoidRootPart", 10)
+            if not newHrp then disconnectAll(); return end
+            -- Wait for the new character to be fully alive
+            local newHum = newChar:WaitForChild("Humanoid", 5)
+            task.wait(0.5)
+
+            -- TP back to the tree (script4 fires teleport twice for reliability)
+            if treePos then
+                pcall(function()
+                    newHrp.CFrame = CFrame.new(treePos + Vector3.new(2, 0, 2))
+                end)
+                task.wait(0.1)
+                pcall(function()
+                    newHrp.CFrame = CFrame.new(treePos + Vector3.new(2, 0, 2))
+                end)
+            end
+            task.wait(0.3)  -- let position commit
+
+            -- Fire pickup on every tracked axe Model
+            local picked = 0
+            for _, axe in ipairs(trackedAxes) do
+                if axe and axe.Parent then
+                    pcall(function() ci:FireServer(axe, "Pick up tool") end)
                     picked = picked + 1
                 end
             end
-        end
-        if picked > 0 then log("  Auto-pickup: " .. picked .. " dropped axes") end
+            log("  Auto-pickup: " .. picked .. "/" .. #trackedAxes .. " axes")
+
+            -- ALSO sweep workspace.PlayerModels right now for ANY axe Model
+            -- that didn't get tracked (e.g. spawned while addConn was off)
+            if pm then
+                for _, b in ipairs(pm:GetChildren()) do
+                    local own = b:FindFirstChild("Owner")
+                    local tn  = b:FindFirstChild("ToolName")
+                    if own and own.Value == LocalPlayer and tn and tn.Value
+                    and (tn.Value:lower():find("axe")
+                         or tn.Value == "BasicHatchet"
+                         or tn.Value == "Rukiryaxe")
+                    and not table.find(trackedAxes, b) then
+                        pcall(function() ci:FireServer(b, "Pick up tool") end)
+                        picked = picked + 1
+                    end
+                end
+            end
+            disconnectAll()
+        end)
+
+        return disconnectAll
     end
 
     local function bringTreeBatch()
@@ -2570,27 +2733,29 @@ do
             for i = 1, n do
                 if i > 1 then log("─── Tree " .. i .. " / " .. n .. " ───") end
 
-                -- Pre-arm a death watcher so we auto-recover axes after
-                -- LoneCave kills us mid-cut. Watcher fires once then
-                -- disconnects; bringTree continues normally.
-                local diedConn
-                local char = LocalPlayer.Character
-                local hum  = char and char:FindFirstChildOfClass("Humanoid")
-                if hum then
-                    diedConn = hum.Died:Connect(function()
-                        if diedConn then diedConn:Disconnect(); diedConn = nil end
-                        log("  ⚠ Player died mid-cut — auto-recovering axes")
-                        task.spawn(recoverAxesAfterDeath)
-                    end)
-                end
+                -- Find the tree FIRST so we can pass its position to the
+                -- auto-pickup setup (used to TP back after respawn)
+                local treePosForRecovery
+                pcall(function()
+                    local t = findBestTree(selectedTreeClass)
+                    if t and t:FindFirstChild("WoodSection") then
+                        treePosForRecovery = t.WoodSection.Position
+                    end
+                end)
+
+                -- Arm all three watchers (died/drop, model-spawn track,
+                -- respawn-pickup) BEFORE the cut starts so we don't miss
+                -- the death race.
+                local cleanup = setupLoneCaveAutoPickup(treePosForRecovery)
 
                 cutAndBringTree()
                 while bringTreeActive do task.wait(0.2) end
 
-                if diedConn then diedConn:Disconnect(); diedConn = nil end
-                -- Inter-tree settle. Bumped 0.3 → 0.6 because batches were
-                -- sometimes "skipping" a tree — the previous log's spawn
-                -- hadn't fully replicated to LogModels.
+                -- If we didn't die during this cut, manually disconnect
+                -- the watchers (they'd otherwise hang around).
+                cleanup()
+
+                -- Inter-tree settle.
                 task.wait(0.6)
             end
             log("✓ Batch complete (" .. n .. " trees)")
@@ -4329,6 +4494,99 @@ do
     makeButtonRow(hpCard, "Find SpookyNeon (server-hops if none here)", "Find SpookyNeon", function()
         findAndTPToTree("SpookyNeon", true)
     end, 12)
+
+    -- ── Utilities from bark hub (script9) + script4 ─────────────
+
+    -- Far Axe Equip (script9 line ~7282): left-click any Tool in
+    -- workspace to pick it up via ClientInteracted — great for
+    -- grabbing dropped axes from across the map without walking.
+    local farPickArmed = false
+    local farPickConn
+    makeButtonRow(hpCard, "Click any workspace Tool to pick up far away", "Far Axe Equip", function()
+        if farPickConn then farPickConn:Disconnect(); farPickConn = nil end
+        farPickArmed = true
+        local interact = game:GetService("ReplicatedStorage"):FindFirstChild("Interaction")
+        local ci = interact and interact:FindFirstChild("ClientInteracted")
+        if not ci then log("✗ Interaction.ClientInteracted missing"); return end
+        log("→ Click a Tool in workspace to far-equip it (right-click cancels)")
+        farPickConn = UserInputService.InputBegan:Connect(function(input, processed)
+            if processed or not farPickArmed then return end
+            if input.UserInputType == Enum.UserInputType.MouseButton2 then
+                farPickArmed = false; farPickConn:Disconnect(); farPickConn = nil
+                log("Far Axe Equip cancelled"); return
+            end
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+            local mouse = LocalPlayer:GetMouse()
+            if not mouse or not mouse.Target then return end
+            -- Walk up to find a Tool / Model with ToolName + Handle
+            local cur = mouse.Target
+            while cur and cur ~= workspace do
+                if cur:IsA("Tool") or (cur:IsA("Model") and cur:FindFirstChild("ToolName")) then
+                    pcall(function() ci:FireServer(cur, "Pick up tool") end)
+                    log("✓ Picked up: " .. cur.Name)
+                    farPickArmed = false
+                    farPickConn:Disconnect(); farPickConn = nil
+                    return
+                end
+                cur = cur.Parent
+            end
+            log("✗ Not a Tool — try again")
+        end)
+    end, 13)
+
+    -- Count Axes (script9 line ~7344): diagnostic — tells you exactly
+    -- how many tools are in Backpack + currently equipped.
+    makeButtonRow(hpCard, "Count axes in Backpack + equipped", "Count Axes", function()
+        local n = 0
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        if bp then for _, t in ipairs(bp:GetChildren()) do
+            if t:IsA("Tool") and t.Name ~= "BlueprintTool" then n = n + 1 end
+        end end
+        local char = LocalPlayer.Character
+        if char then for _, t in ipairs(char:GetChildren()) do
+            if t:IsA("Tool") and t.Name ~= "BlueprintTool" then n = n + 1 end
+        end end
+        log("You have " .. n .. " axe(s) in inventory")
+    end, 14)
+
+    -- Sit In Any Car (script4 line ~1000): disables the SitPermissions
+    -- LocalScript so the "only owner can sit" check never fires.
+    local sitAnyOn = false
+    makeTitleRow(hpCard, "Sit In Any Car", false, function(on)
+        sitAnyOn = on
+        local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+                or LocalPlayer:FindFirstChild("PlayerGui")
+        local sp = ps and (ps:FindFirstChild("SitPermissions", true))
+        if not sp then
+            log("✗ SitPermissions script not found")
+            return
+        end
+        pcall(function() sp.Disabled = on end)
+        log("Sit In Any Car: " .. tostring(on))
+    end, 15)
+
+    -- Disable Lava (script4 ~3960): destroys the lava destruction
+    -- script on every volcano lava part so they no longer damage
+    -- characters / burn wood you set on them.
+    makeButtonRow(hpCard, "Defang volcano lava (one-shot)", "Disable Lava", function()
+        local vol = workspace:FindFirstChild("Region_Volcano")
+        if not vol then log("✗ Region_Volcano missing"); return end
+        local n = 0
+        for _, lava in ipairs(vol:GetChildren()) do
+            if lava.Name == "Lava" then
+                for _, child in ipairs(lava:GetDescendants()) do
+                    if child:IsA("Script") or child:IsA("LocalScript") then
+                        pcall(function() child:Destroy() end)
+                        n = n + 1
+                    end
+                    if child:IsA("BasePart") then
+                        pcall(function() child.CanTouch = false end)
+                    end
+                end
+            end
+        end
+        log("✓ Disabled lava — destroyed " .. n .. " script(s) + killed CanTouch")
+    end, 16)
 
     end  -- close Helpers local-scope
 
