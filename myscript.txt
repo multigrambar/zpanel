@@ -2434,6 +2434,17 @@ do
                     and child:FindFirstChild("TreeClass")
                     and child.TreeClass.Value == treeClass then
                         newLog = child
+
+                        -- INSTANT ANCHOR every BasePart so the log can't
+                        -- fall into the void during the shuttle setup.
+                        -- We restore CanCollide/Anchored after the shuttle
+                        -- (in phase 9) so the player can interact with it.
+                        for _, p in ipairs(child:GetDescendants()) do
+                            if p:IsA("BasePart") then
+                                pcall(function() p.Anchored = true end)
+                            end
+                        end
+
                         -- Drag-spam ownership 10x with Heartbeat waits
                         for _ = 1, 10 do
                             pcall(function() dragRemote:FireServer(child) end)
@@ -2446,6 +2457,8 @@ do
                                                  or child:FindFirstChildWhichIsA("BasePart", true)
                             end)
                         end
+                        -- Shuttle to origin while anchored — bulletproof,
+                        -- no gravity, no server snap-back
                         if child.PrimaryPart then
                             pcall(function() child:SetPrimaryPartCFrame(originCF) end)
                         end
@@ -2501,7 +2514,8 @@ do
 
                 -- Death detection: Character was destroyed/replaced mid-chop
                 if liveChar ~= trackedChar then
-                    log("  ⚠ Died mid-chop — waiting for respawn to resume tree")
+                    log("  ⚠ Died mid-chop — recovering…")
+
                     -- 1) Wait until the new Character exists + HRP is loaded
                     local newChar = LocalPlayer.Character
                     if not newChar or not newChar:FindFirstChild("HumanoidRootPart") then
@@ -2509,25 +2523,36 @@ do
                     end
                     newChar:WaitForChild("HumanoidRootPart", 10)
                     newChar:WaitForChild("Humanoid", 5)
-                    task.wait(1.0)  -- let setupLoneCaveAutoPickup's CharacterAdded run + pickup
+                    log("  · Respawned; waiting for axe to land in Backpack…")
 
-                    -- 2) Grab the NEW axe reference (the old one's parent is gone)
-                    local newAxe = getBestAxeLT2(treeClass)
+                    -- 2) RETRY axe-grab for up to 5 seconds. The pickup
+                    --    handler in setupLoneCaveAutoPickup is racing us;
+                    --    we poll Backpack every 0.2s until an axe shows.
+                    local newAxe
+                    local axeDeadline = tick() + 5
+                    while tick() < axeDeadline do
+                        newAxe = getBestAxeLT2(treeClass)
+                        if newAxe then break end
+                        task.wait(0.2)
+                    end
                     if not newAxe then
-                        log("  ✗ No axe in new inventory — aborting this tree")
+                        log("  ✗ Axe never returned after 5s — aborting this tree")
                         break
                     end
                     chopArgs.tool = newAxe
                     axe = newAxe
+                    log("  · Got axe back: " .. axe.ToolName.Value)
 
-                    -- 3) TP back to the tree base (cutSec might still be valid)
+                    -- 3) TP back to the tree base
                     local nHrp = newChar:FindFirstChild("HumanoidRootPart")
                     if nHrp and cutSec and cutSec.Parent then
                         pcall(function() nHrp.CFrame = cutSec.CFrame end)
+                        task.wait(0.15)
+                        pcall(function() nHrp.CFrame = cutSec.CFrame end)
+                        log("  · TP'd back to tree")
                     end
 
-                    -- 4) Re-establish the in-trunk HRP lock (BodyPosition + BodyGyro
-                    --    + Heartbeat re-snap) on the new character. Skip for LoneCave.
+                    -- 4) Re-establish the in-trunk HRP lock for non-LoneCave
                     if treeClass ~= "LoneCave" and cutSec and cutSec.Parent then
                         pcall(function() nHrp.CanCollide = false end)
                         if lockBP and lockBP.Parent then lockBP:Destroy() end
@@ -2547,14 +2572,15 @@ do
                     end
 
                     trackedChar = newChar
-                    log("  ✓ Resumed chopping — axe=" .. axe.ToolName.Value)
+                    log("  ✓ Resuming chop on same tree — total elapsed "
+                        .. math.floor(tick() - t0) .. "s")
                 end
 
                 if cutEvent and cutEvent.Parent then
                     pcall(function() remoteProxy:FireServer(cutEvent, chopArgs) end)
                 end
                 task.wait()
-            until treeIsCut or (tick() - t0) > 90 or not bringTreeActive
+            until treeIsCut or (tick() - t0) > 120 or not bringTreeActive
               or (cutEvent and not cutEvent.Parent)  -- tree got destroyed externally
 
             -- 7) Cleanup hooks AND release the in-trunk lock — must happen
@@ -2574,10 +2600,12 @@ do
                 return
             end
 
-            -- 8) Settle pass — give the in-watcher SetPrimaryPartCFrame a
-            --    moment to commit, then double-tap with PivotTo + drag-spam
-            --    in case the server bounced the first write.
-            task.wait(0.2)
+            -- 8) Settle pass + position verify. Log was already anchored
+            --    in the LogModels.ChildAdded watcher so it can't have
+            --    fallen. PivotTo it again here in case the in-watcher
+            --    shuttle missed, then verify it's actually at origin.
+            --    Retry up to 5 times if not.
+            task.wait(0.15)
             if newLog and newLog.Parent then
                 if not newLog.PrimaryPart then
                     pcall(function()
@@ -2585,24 +2613,60 @@ do
                                           or newLog:FindFirstChildWhichIsA("BasePart", true)
                     end)
                 end
+
+                -- Drag-spam in parallel (server-side ownership claim)
                 task.spawn(function()
-                    for _ = 1, 30 do
+                    for _ = 1, 60 do
                         if not newLog or not newLog.Parent then break end
                         pcall(function() dragRemote:FireServer(newLog) end)
                         task.wait()
                     end
                 end)
-                for _ = 1, 30 do
+
+                -- Anchor-PivotTo retry loop. Anchored parts can be
+                -- PivotTo'd freely without gravity fighting back. Up
+                -- to 5 retries with verification.
+                local shuttleOk = false
+                for attempt = 1, 5 do
                     if not newLog or not newLog.Parent then break end
+                    -- Re-anchor (server may have unanchored on its end)
+                    for _, p in ipairs(newLog:GetDescendants()) do
+                        if p:IsA("BasePart") then
+                            pcall(function()
+                                p.Anchored = true
+                                p.AssemblyLinearVelocity  = Vector3.zero
+                                p.AssemblyAngularVelocity = Vector3.zero
+                            end)
+                        end
+                    end
+                    -- PivotTo origin
                     if newLog.PrimaryPart then
-                        pcall(function() newLog.PrimaryPart.Velocity = Vector3.zero end)
                         pcall(function() newLog:PivotTo(originCF) end)
                     end
-                    task.wait()
+                    task.wait(0.15)
+                    -- Verify within 10 studs of origin
+                    local pp = newLog.PrimaryPart or newLog:FindFirstChild("WoodSection")
+                    if pp and (pp.Position - originCF.Position).Magnitude < 10 then
+                        shuttleOk = true
+                        log("  ✓ Log shuttled in " .. attempt .. " attempt(s)")
+                        break
+                    end
+                end
+                if not shuttleOk then
+                    log("  ⚠ Shuttle didn't quite land — log is still anchored,"
+                        .. " manually move it or it'll stay where it is")
+                end
+
+                -- 9) Unanchor so player can drag/sell normally. Velocity
+                --    already zero from above so no surprise drop.
+                for _, p in ipairs(newLog:GetDescendants()) do
+                    if p:IsA("BasePart") then
+                        pcall(function() p.Anchored = false end)
+                    end
                 end
             end
 
-            -- 9) Final TP player back next to the log
+            -- 10) Final TP player back next to the log
             local liveChar = LocalPlayer.Character
             local liveHrp  = liveChar and liveChar:FindFirstChild("HumanoidRootPart")
             if liveHrp and newLog and newLog.Parent then
