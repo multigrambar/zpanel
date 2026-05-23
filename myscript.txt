@@ -2488,14 +2488,74 @@ do
                 cuttingClass = "Axe",
             }
 
-            -- 6) Chop every frame (script4 pattern: repeat wait() chop() until cut)
+            -- 6) Chop every frame (script4 pattern: repeat wait() chop() until cut).
+            --    Death-resilient: if the player dies during the chop (LoneCave
+            --    crush, Volcano lava, falling damage), wait for respawn and
+            --    re-grab the axe + re-establish the in-trunk lock, then RESUME
+            --    chopping the SAME tree. Total timeout 90s covers multiple
+            --    death cycles for a single LoneCave tree.
             local t0 = tick()
+            local trackedChar = LocalPlayer.Character
             repeat
+                local liveChar = LocalPlayer.Character
+
+                -- Death detection: Character was destroyed/replaced mid-chop
+                if liveChar ~= trackedChar then
+                    log("  ⚠ Died mid-chop — waiting for respawn to resume tree")
+                    -- 1) Wait until the new Character exists + HRP is loaded
+                    local newChar = LocalPlayer.Character
+                    if not newChar or not newChar:FindFirstChild("HumanoidRootPart") then
+                        newChar = LocalPlayer.CharacterAdded:Wait()
+                    end
+                    newChar:WaitForChild("HumanoidRootPart", 10)
+                    newChar:WaitForChild("Humanoid", 5)
+                    task.wait(1.0)  -- let setupLoneCaveAutoPickup's CharacterAdded run + pickup
+
+                    -- 2) Grab the NEW axe reference (the old one's parent is gone)
+                    local newAxe = getBestAxeLT2(treeClass)
+                    if not newAxe then
+                        log("  ✗ No axe in new inventory — aborting this tree")
+                        break
+                    end
+                    chopArgs.tool = newAxe
+                    axe = newAxe
+
+                    -- 3) TP back to the tree base (cutSec might still be valid)
+                    local nHrp = newChar:FindFirstChild("HumanoidRootPart")
+                    if nHrp and cutSec and cutSec.Parent then
+                        pcall(function() nHrp.CFrame = cutSec.CFrame end)
+                    end
+
+                    -- 4) Re-establish the in-trunk HRP lock (BodyPosition + BodyGyro
+                    --    + Heartbeat re-snap) on the new character. Skip for LoneCave.
+                    if treeClass ~= "LoneCave" and cutSec and cutSec.Parent then
+                        pcall(function() nHrp.CanCollide = false end)
+                        if lockBP and lockBP.Parent then lockBP:Destroy() end
+                        if lockBG and lockBG.Parent then lockBG:Destroy() end
+                        lockBP = Instance.new("BodyPosition")
+                        lockBP.Name = "AntiFallLock"
+                        lockBP.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                        lockBP.P = 1e5; lockBP.D = 1250
+                        lockBP.Position = cutSec.CFrame.Position
+                        lockBP.Parent = nHrp
+                        lockBG = Instance.new("BodyGyro")
+                        lockBG.Name = "AntiFallGyro"
+                        lockBG.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+                        lockBG.P = 1e5; lockBG.D = 250
+                        lockBG.CFrame = cutSec.CFrame
+                        lockBG.Parent = nHrp
+                    end
+
+                    trackedChar = newChar
+                    log("  ✓ Resumed chopping — axe=" .. axe.ToolName.Value)
+                end
+
                 if cutEvent and cutEvent.Parent then
                     pcall(function() remoteProxy:FireServer(cutEvent, chopArgs) end)
                 end
                 task.wait()
-            until treeIsCut or (tick() - t0) > 20 or not bringTreeActive
+            until treeIsCut or (tick() - t0) > 90 or not bringTreeActive
+              or (cutEvent and not cutEvent.Parent)  -- tree got destroyed externally
 
             -- 7) Cleanup hooks AND release the in-trunk lock — must happen
             --    before the post-cut shuttle so PivotTo can actually move
